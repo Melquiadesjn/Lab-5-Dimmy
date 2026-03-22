@@ -71,7 +71,11 @@ def tokenize_pairs(pairs, max_len=50):
         2. Para cada par (EN, DE):
            - Tokeniza a frase EN  → IDs do Encoder (entrada)
            - Tokeniza a frase DE  → IDs do Decoder com <START> e <EOS>
-        3. Aplica padding (preenche com zeros) para que todas as frases
+        3. Remapeia os IDs originais do BERT (que vão até ~119k) para um
+           vocabulário compacto contendo APENAS os tokens que aparecem no
+           nosso subset. Isso reduz drasticamente a memória necessária.
+           Ex: BERT ID 13214 → nosso ID 47
+        4. Aplica padding (preenche com zeros) para que todas as frases
            tenham o mesmo comprimento no batch
 
     Parâmetros:
@@ -79,33 +83,63 @@ def tokenize_pairs(pairs, max_len=50):
         max_len : comprimento máximo permitido (frases maiores são cortadas)
 
     Retorna:
-        enc_ids : tensor (N, max_len) — IDs de entrada do Encoder
-        dec_ids : tensor (N, max_len) — IDs de entrada do Decoder (com <START>)
-        labels  : tensor (N, max_len) — IDs esperados na saída (com <EOS>)
+        enc_ids   : tensor (N, max_len) — IDs de entrada do Encoder (remapeados)
+        dec_ids   : tensor (N, max_len) — IDs de entrada do Decoder (com <START>)
+        labels    : tensor (N, max_len) — IDs esperados na saída (com <EOS>)
+        vocab_size: tamanho do vocabulário compacto
         tokenizer : o tokenizador carregado (para decodificar depois)
+        id_to_bert: mapeamento inverso (nosso ID → BERT ID) para decodificar
     """
     print("\nCarregando tokenizador BERT multilingual...")
     tokenizer = AutoTokenizer.from_pretrained("bert-base-multilingual-cased")
 
-    enc_all = []   # IDs do Encoder (frases em inglês)
-    dec_all = []   # IDs de entrada do Decoder (frases em alemão com <START>)
-    lbl_all = []   # Labels esperados (frases em alemão com <EOS>)
+    # Primeira passada: tokeniza tudo e coleta os IDs únicos do BERT
+    enc_raw = []
+    dec_raw = []
+    unique_ids = set()
 
     for en_text, de_text in pairs:
-        # Tokeniza as frases usando BERT (sem tokens especiais dele, usamos os nossos)
         en_ids = tokenizer.encode(en_text, add_special_tokens=False)
         de_ids = tokenizer.encode(de_text, add_special_tokens=False)
 
-        # Corta se exceder o limite (reservando espaço para <START>/<EOS>)
         en_ids = en_ids[:max_len]
-        de_ids = de_ids[:max_len - 1]  # -1 para caber o <START> ou <EOS>
+        de_ids = de_ids[:max_len - 1]
+
+        enc_raw.append(en_ids)
+        dec_raw.append(de_ids)
+
+        unique_ids.update(en_ids)
+        unique_ids.update(de_ids)
+
+    # Cria mapeamento compacto: BERT ID → nosso ID (começando do 3,
+    # pois 0=PAD, 1=START, 2=EOS já estão reservados)
+    bert_to_compact = {}
+    compact_to_bert = {PAD_ID: 0, START_ID: 1, EOS_ID: 2}
+    next_id = 3  # próximo ID disponível
+
+    for bert_id in sorted(unique_ids):
+        bert_to_compact[bert_id] = next_id
+        compact_to_bert[next_id] = bert_id
+        next_id += 1
+
+    compact_vocab_size = next_id
+
+    # Segunda passada: remapeia os IDs e adiciona tokens especiais
+    enc_all = []
+    dec_all = []
+    lbl_all = []
+
+    for en_ids, de_ids in zip(enc_raw, dec_raw):
+        # Remapeia BERT IDs → IDs compactos
+        en_compact = [bert_to_compact[i] for i in en_ids]
+        de_compact = [bert_to_compact[i] for i in de_ids]
 
         # Decoder input:  [<START>, token1, token2, ...]
         # Label (target):  [token1, token2, ..., <EOS>]
-        dec_input = [START_ID] + de_ids
-        label     = de_ids + [EOS_ID]
+        dec_input = [START_ID] + de_compact
+        label     = de_compact + [EOS_ID]
 
-        enc_all.append(en_ids)
+        enc_all.append(en_compact)
         dec_all.append(dec_input)
         lbl_all.append(label)
 
@@ -127,11 +161,12 @@ def tokenize_pairs(pairs, max_len=50):
     print(f"  Shape Encoder input:  {enc_ids.shape}")
     print(f"  Shape Decoder input:  {dec_ids.shape}")
     print(f"  Shape Labels:         {labels.shape}")
-    print(f"  Vocab size tokenizer: {tokenizer.vocab_size}")
+    print(f"  Vocab original BERT:  {tokenizer.vocab_size}")
+    print(f"  Vocab compacto:       {compact_vocab_size} (apenas tokens usados)")
     print(f"  Exemplo enc_ids[0][:10]: {enc_ids[0][:10].tolist()}")
     print(f"  Exemplo dec_ids[0][:10]: {dec_ids[0][:10].tolist()}")
 
-    return enc_ids, dec_ids, labels, tokenizer
+    return enc_ids, dec_ids, labels, compact_vocab_size, tokenizer, compact_to_bert
 
 
 # =============================================================================
@@ -262,13 +297,13 @@ if __name__ == "__main__":
     # Tarefa 1 — carrega dataset
     pairs = load_multi30k(num_samples=1000)
 
-    # Tarefa 2 — tokeniza os pares
-    enc_ids, dec_ids, labels, tokenizer = tokenize_pairs(pairs)
+    # Tarefa 2 — tokeniza os pares (com remapeamento compacto de vocab)
+    enc_ids, dec_ids, labels, vocab_size, tokenizer, id_to_bert = tokenize_pairs(pairs)
 
     # Tarefa 3 — treina o modelo
     model, losses = train_model(
         enc_ids, dec_ids, labels,
-        vocab_size=tokenizer.vocab_size,
+        vocab_size=vocab_size,
         num_epochs=15,
         d_model=128,
         d_ff=512,
